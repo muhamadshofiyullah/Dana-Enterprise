@@ -1,0 +1,231 @@
+name: Telegram Release Notification
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  notify-telegram:
+    name: Send Telegram Release Notification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Notification to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_NAME: ${{ github.repository }}
+          TAG_NAME: ${{ github.event.release.tag_name || 'v1.0.0-test' }}
+          RELEASE_TITLE: ${{ github.event.release.name || 'Test Release Notification' }}
+          RELEASE_URL: ${{ github.event.release.html_url || format('{0}/{1}/releases', github.server_url, github.repository) }}
+          RELEASE_BODY: ${{ github.event.release.body || 'No release notes provided.' }}
+          RELEASE_AUTHOR: ${{ github.event.release.author.login || github.actor }}
+          IS_PRERELEASE: ${{ github.event.release.prerelease || false }}
+          INCLUDE_ASSETS: true
+          RELEASE_ASSETS_JSON: ${{ toJson(github.event.release.assets) }}
+          CUSTOM_TEMPLATE: |
+            {badge}<b><a href="{url}">{repo}</a></b>
+            
+            📦 <b>Release:</b> {title}
+            🏷️ <b>Tag:</b> <code>{version}</code>
+            👤 <b>Author:</b> @{author}
+            
+            📝 <b>Release Notes:</b>
+            <blockquote>{notes}</blockquote>
+            
+            🔗 <a href="{url}">View Release</a> | 📥 <a href="{download_zip}">Download {asset_name}</a>
+        run: |
+          python3 - << 'EOF'
+          import os
+          import urllib.request
+          import json
+          import html
+          import re
+          import time
+
+          bot_token = os.environ.get('TELEGRAM_BOT_TOKEN', '').strip()
+          chat_id = os.environ.get('TELEGRAM_CHAT_ID', '').strip()
+          thread_id = os.environ.get('TELEGRAM_THREAD_ID', '').strip()
+          custom_template = os.environ.get('CUSTOM_TEMPLATE', '').strip()
+          repo = os.environ.get('REPO_NAME', 'Repository')
+          tag = os.environ.get('TAG_NAME', '')
+          title = os.environ.get('RELEASE_TITLE', '') or tag
+          url = os.environ.get('RELEASE_URL', '')
+          body = os.environ.get('RELEASE_BODY', '').strip()
+          author = os.environ.get('RELEASE_AUTHOR', '').strip()
+          is_prerelease = os.environ.get('IS_PRERELEASE', 'false').lower() == 'true'
+          include_assets = os.environ.get('INCLUDE_ASSETS', 'true').lower() == 'true'
+
+          if not bot_token or not chat_id:
+              print('::error::TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing.')
+              exit(1)
+
+          badge = '🧪 <b>[PRE-RELEASE]</b> ' if is_prerelease else '🚀 <b>[NEW RELEASE]</b> '
+          safe_repo = html.escape(repo)
+          safe_tag = html.escape(tag)
+          safe_title = html.escape(title)
+          safe_author = html.escape(author)
+
+          def format_release_notes(md_text):
+              if not md_text:
+                  return ''
+              if len(md_text) > 1500:
+                  md_text = md_text[:1500] + '\n...(truncated)'
+              lines = md_text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+              cleaned_lines = []
+              for line in lines:
+                  stripped = line.strip()
+                  if re.match(r'^(?:-{3,}|\*{3,}|_{3,})$', stripped):
+                      continue
+                  heading_match = re.match(r'^(#{1,6})\s+(.*)$', stripped)
+                  if heading_match:
+                      content = heading_match.group(2).strip()
+                      content = html.escape(content)
+                      content = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', content)
+                      cleaned_lines.append(f'<b>{content}</b>')
+                      continue
+                  list_match = re.match(r'^(\s*)[-*+]\s+(.*)$', line)
+                  if list_match:
+                      indent = list_match.group(1)
+                      content = list_match.group(2)
+                      content = html.escape(content)
+                      content = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', content)
+                      content = re.sub(r'__(.+?)__', r'<b>\1</b>', content)
+                      content = re.sub(r'`([^`]+)`', r'<code>\1</code>', content)
+                      content = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'<a href="\2">\1</a>', content)
+                      bullet_indent = '  ' * (len(indent) // 2)
+                      cleaned_lines.append(f'{bullet_indent}• {content}')
+                      continue
+                  content = html.escape(line)
+                  content = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', content)
+                  content = re.sub(r'__(.+?)__', r'<b>\1</b>', content)
+                  content = re.sub(r'`([^`]+)`', r'<code>\1</code>', content)
+                  content = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'<a href="\2">\1</a>', content)
+                  cleaned_lines.append(content)
+              return '\n'.join(cleaned_lines).strip()
+
+          safe_body = format_release_notes(body)
+
+          assets_raw = os.environ.get('RELEASE_ASSETS_JSON', '').strip()
+          assets = []
+          if assets_raw and assets_raw != 'null':
+              try:
+                  assets = json.loads(assets_raw)
+              except Exception:
+                  pass
+
+          if not assets and tag:
+              try:
+                  gh_token = os.environ.get('GITHUB_TOKEN', '').strip()
+                  api_headers = {'User-Agent': 'GithubNotifier'}
+                  if gh_token:
+                      api_headers['Authorization'] = f'Bearer {gh_token}'
+                  api_req = urllib.request.Request(f'https://api.github.com/repos/{repo}/releases/tags/{tag}', headers=api_headers)
+                  with urllib.request.urlopen(api_req) as resp:
+                      rel_data = json.loads(resp.read().decode())
+                      assets = rel_data.get('assets', [])
+              except Exception as e:
+                  print(f'::warning::Could not fetch release assets from GitHub API: {e}')
+
+          asset_url = ''
+          asset_name = ''
+          if assets and isinstance(assets, list):
+              zip_asset = next((a for a in assets if isinstance(a, dict) and a.get('name', '').lower().endswith('.zip')), None)
+              chosen = zip_asset if zip_asset else (assets[0] if isinstance(assets[0], dict) else None)
+              if chosen:
+                  asset_url = chosen.get('browser_download_url', '')
+                  asset_name = chosen.get('name', '')
+
+          if not asset_url:
+              asset_url = f'https://github.com/{repo}/archive/refs/tags/{tag}.zip' if tag else url
+              asset_name = f'{tag}.zip' if tag else 'Source.zip'
+
+          safe_asset_name = html.escape(asset_name)
+
+          if custom_template:
+              full_message = custom_template.replace('{repo}', safe_repo) \
+                                            .replace('{version}', safe_tag) \
+                                            .replace('{tag}', safe_tag) \
+                                            .replace('{title}', safe_title) \
+                                            .replace('{author}', safe_author) \
+                                            .replace('{notes}', safe_body) \
+                                            .replace('{body}', safe_body) \
+                                            .replace('{url}', url) \
+                                            .replace('{badge}', badge) \
+                                            .replace('{download_zip}', asset_url) \
+                                            .replace('{asset_url}', asset_url) \
+                                            .replace('{asset_name}', safe_asset_name)
+          else:
+              msg_parts = [
+                  f'{badge}<b><a href="{url}">{safe_repo}</a></b>',
+                  '',
+                  f'📦 <b>Release:</b> {safe_title}',
+                  f'🏷️ <b>Tag:</b> <code>{safe_tag}</code>',
+              ]
+
+              if safe_author:
+                  msg_parts.append(f'👤 <b>Author:</b> @{safe_author}')
+
+              if safe_body:
+                  msg_parts.extend(['', '📝 <b>Release Notes:</b>', f'<blockquote>{safe_body}</blockquote>'])
+
+              links = [f'<a href="{url}">🔗 View Release</a>']
+              if include_assets and asset_url:
+                  links.append(f'<a href="{asset_url}">📥 Download {safe_asset_name}</a>')
+
+              msg_parts.extend(['', ' | '.join(links)])
+              full_message = '\n'.join(msg_parts)
+
+          raw_targets = re.split(r'[,;\n]+', chat_id)
+          targets = []
+          for rt in raw_targets:
+              t = rt.strip()
+              if not t:
+                  continue
+              if ':' in t:
+                  p = t.split(':', 1)
+                  targets.append((p[0].strip(), p[1].strip()))
+              else:
+                  targets.append((t, thread_id))
+
+          if not targets:
+              print('::error::No valid Telegram Chat ID found.')
+              exit(1)
+
+          api_url = f'https://api.telegram.org/bot{bot_token}/sendMessage'
+          sent_count = 0
+          for tgt_chat, tgt_thread in targets:
+              payload = {
+                  'chat_id': tgt_chat,
+                  'text': full_message,
+                  'parse_mode': 'HTML',
+                  'disable_web_page_preview': False
+              }
+              if tgt_thread and tgt_thread.isdigit():
+                  payload['message_thread_id'] = int(tgt_thread)
+
+              req = urllib.request.Request(
+                  api_url,
+                  data=json.dumps(payload).encode('utf-8'),
+                  headers={'Content-Type': 'application/json'}
+              )
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      res = json.loads(resp.read().decode())
+                      if res.get('ok'):
+                          print(f'::notice::Telegram notification sent to {tgt_chat} successfully!')
+                          sent_count += 1
+                      else:
+                          print(f'::warning::Telegram API error for {tgt_chat}: {res}')
+              except Exception as e:
+                  print(f'::warning::Failed to send to {tgt_chat}: {e}')
+
+              if len(targets) > 1:
+                  time.sleep(0.5)
+
+          if sent_count == 0:
+              print('::error::Failed to send Telegram notification to all recipients.')
+              exit(1)
+          EOF
